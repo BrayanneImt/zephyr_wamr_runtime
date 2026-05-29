@@ -8,6 +8,7 @@
 #include <zephyr/net/net_event.h>
 #include <zephyr/net/dhcpv4.h>
 #include <zephyr/net/socket.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
@@ -23,13 +24,13 @@ static const struct gpio_dt_spec board_led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
 #define HAS_LED 0
 #endif
 
-#define WASM_MAX_SIZE  (32 * 1024)
-#define WAMR_POOL_SIZE (110 * 1024)
-#define STACK_SIZE     (8  * 1024)
-#define HEAP_SIZE      (16 * 1024)
+#define WASM_MAX_SIZE (32 * 1024)
+#define STACK_SIZE    (8  * 1024)
+#define HEAP_SIZE     (16 * 1024)
 
+/* Seul buffer BSS statique : 32KB */
 static uint8_t wasm_buffer[WASM_MAX_SIZE];
-static char    global_heap[WAMR_POOL_SIZE];
+
 static const struct device *uart_dev;
 
 static K_SEM_DEFINE(net_ready_wamr, 0, 1);
@@ -59,13 +60,22 @@ static void uart_drain_rx(const struct device *dev)
     } while (drained > 0);
 }
 
+/* ----------------------------------------------------------------
+ * Fonctions d'allocation pointées vers malloc/free de picolibc.
+ * Ces fonctions utilisent le libc heap (espace libre entre BSS
+ * et fin de DRAM), séparé du k_heap utilisé par le réseau Zephyr.
+ * ---------------------------------------------------------------- */
+static void *wamr_malloc(unsigned int size)  { return malloc(size); }
+static void *wamr_realloc(void *ptr, unsigned int size) { return realloc(ptr, size); }
+static void  wamr_free(void *ptr)            { free(ptr); }
+
 /* ==============================================================
  * HOST FUNCTIONS
  * ============================================================== */
 
 static int32_t host_wifi_connect_impl(wasm_exec_env_t exec_env,
-                                       uint32_t ssid_ptr, uint32_t ssid_len,
-                                       uint32_t psk_ptr,  uint32_t psk_len)
+    uint32_t ssid_ptr, uint32_t ssid_len,
+    uint32_t psk_ptr,  uint32_t psk_len)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
     const char *ssid = (const char *)wasm_runtime_addr_app_to_native(inst, ssid_ptr);
@@ -114,18 +124,16 @@ static void host_gpio_blink_impl(wasm_exec_env_t exec_env)
 }
 
 static int32_t host_tcp_connect_impl(wasm_exec_env_t exec_env,
-                                      uint32_t ip_ptr, uint32_t ip_len,
-                                      uint32_t port,   uint32_t timeout_secs)
+    uint32_t ip_ptr, uint32_t ip_len, uint32_t port, uint32_t timeout_secs)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
     const char *ip = (const char *)wasm_runtime_addr_app_to_native(inst, ip_ptr);
     if (!ip) { return -1; }
 
-    /* Copier l'IP dans un buffer null-terminé */
     char ip_str[32];
-    uint32_t copy_len = ip_len < sizeof(ip_str) - 1 ? ip_len : sizeof(ip_str) - 1;
-    memcpy(ip_str, ip, copy_len);
-    ip_str[copy_len] = '\0';
+    uint32_t n = ip_len < sizeof(ip_str)-1 ? ip_len : sizeof(ip_str)-1;
+    memcpy(ip_str, ip, n);
+    ip_str[n] = '\0';
 
     int sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) { return -1; }
@@ -134,26 +142,20 @@ static int32_t host_tcp_connect_impl(wasm_exec_env_t exec_env,
     zsock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     zsock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
+    struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons((uint16_t)port);
-
     if (zsock_inet_pton(AF_INET, ip_str, &addr.sin_addr) != 1) {
-        zsock_close(sock);
-        return -1;
+        zsock_close(sock); return -1;
     }
-
     if (zsock_connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        zsock_close(sock);
-        return -1;
+        zsock_close(sock); return -1;
     }
-
     return sock;
 }
 
 static int32_t host_tcp_send_impl(wasm_exec_env_t exec_env,
-                                   int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
+    int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
     const uint8_t *buf = (const uint8_t *)wasm_runtime_addr_app_to_native(inst, buf_ptr);
@@ -162,7 +164,7 @@ static int32_t host_tcp_send_impl(wasm_exec_env_t exec_env,
 }
 
 static int32_t host_tcp_recv_impl(wasm_exec_env_t exec_env,
-                                   int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
+    int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
     uint8_t *buf = (uint8_t *)wasm_runtime_addr_app_to_native(inst, buf_ptr);
@@ -193,9 +195,6 @@ static NativeSymbol native_symbols[] = {
     { "host_sleep",              host_sleep_impl,              "(i)",     NULL },
 };
 
-/* ----------------------------------------------------------------
- * execute_wasm()
- * ---------------------------------------------------------------- */
 static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
 {
     char error_buf[128];
@@ -231,9 +230,6 @@ cleanup_inst:   wasm_runtime_deinstantiate(module_inst);
 cleanup_module: wasm_runtime_unload(module);
 }
 
-/* ----------------------------------------------------------------
- * main()
- * ---------------------------------------------------------------- */
 int main(void)
 {
 #if HAS_LED
@@ -244,11 +240,21 @@ int main(void)
 
     RuntimeInitArgs init_args;
     memset(&init_args, 0, sizeof(init_args));
-    init_args.mem_alloc_type                  = Alloc_With_Pool;
-    init_args.mem_alloc_option.pool.heap_buf  = global_heap;
-    init_args.mem_alloc_option.pool.heap_size = sizeof(global_heap);
 
-    if (!wasm_runtime_full_init(&init_args)) { printk("WAMR init failed\n"); return -1; }
+    /*
+     * Alloc_With_Allocator → malloc/free de picolibc (libc heap).
+     * Séparé du k_heap Zephyr utilisé par le réseau.
+     * CONFIG_COMMON_LIBC_MALLOC_ARENA_SIZE dans prj.conf contrôle
+     * la taille maximale de cet espace (192KB).
+     */
+    init_args.mem_alloc_type = Alloc_With_Allocator;
+    init_args.mem_alloc_option.allocator.malloc_func  = wamr_malloc;
+    init_args.mem_alloc_option.allocator.realloc_func = wamr_realloc;
+    init_args.mem_alloc_option.allocator.free_func    = wamr_free;
+
+    if (!wasm_runtime_full_init(&init_args)) {
+        printk("WAMR init failed\n"); return -1;
+    }
     printk("WAMR init OK\n");
 
     if (!wasm_runtime_register_natives("env", native_symbols, ARRAY_SIZE(native_symbols))) {
