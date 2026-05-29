@@ -1,145 +1,234 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/net/net_event.h>
+#include <zephyr/net/dhcpv4.h>
+#include <zephyr/net/socket.h>
 #include <string.h>
+#include <errno.h>
 
 #include "wasm_export.h"
 
-/* ----------------------------------------------------------------
- * Nœud UART — console série utilisée pour recevoir le .wasm
- * ---------------------------------------------------------------- */
 #define UART_NODE DT_CHOSEN(zephyr_console)
+#define LED_NODE  DT_ALIAS(led0)
 
-/* ----------------------------------------------------------------
- * Tailles mémoire
- *
- * WASM_MAX_SIZE : taille maximale acceptée pour le fichier .wasm
- *                (128 Ko couvre les .wasm C et Rust de ce projet)
- *
- * STACK_SIZE    : stack alloué à l'instance WASM et à l'exec env
- *                 32 Ko évite les stack overflow sur des .wasm
- *                 comportant de la récursion ou de grandes frames.
- *
- * HEAP_SIZE     : heap linéaire de l'instance WASM
- *                 64 Ko suffisent pour les buffers socket (512 o)
- *                 et les chaînes de l'application HTTP.
- * ---------------------------------------------------------------- */
-#define WASM_MAX_SIZE (128 * 1024)
-#define STACK_SIZE    (16  * 1024)
-#define HEAP_SIZE     (32  * 1024)
+#if DT_NODE_HAS_STATUS(LED_NODE, okay)
+static const struct gpio_dt_spec board_led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
+#define HAS_LED 1
+#else
+#define HAS_LED 0
+#endif
 
-/* ----------------------------------------------------------------
- * Buffers statiques
- *
- * wasm_buffer  : reçoit le binaire .wasm envoyé par UART
- * global_heap  : pool mémoire donné à WAMR à l'initialisation
- *                (WAMR y alloue ses structures internes)
- * ---------------------------------------------------------------- */
+#define WASM_MAX_SIZE  (32 * 1024)
+#define WAMR_POOL_SIZE (110 * 1024)
+#define STACK_SIZE     (8  * 1024)
+#define HEAP_SIZE      (16 * 1024)
+
 static uint8_t wasm_buffer[WASM_MAX_SIZE];
-static char    global_heap[HEAP_SIZE];
-
-/* Handle UART */
+static char    global_heap[WAMR_POOL_SIZE];
 static const struct device *uart_dev;
 
-/* ----------------------------------------------------------------
- * uart_read_byte() — lecture bloquante d'un octet sur l'UART
- *
- * uart_poll_in() retourne -1 si aucun octet n'est disponible.
- * On boucle jusqu'à recevoir effectivement un octet, en cédant
- * le CPU à chaque itération via k_yield() pour ne pas bloquer
- * les autres threads Zephyr.
- * ---------------------------------------------------------------- */
-static void uart_read_byte(const struct device *dev, uint8_t *out)
+static K_SEM_DEFINE(net_ready_wamr, 0, 1);
+static struct net_mgmt_event_callback dhcp_cb_wamr;
+
+static void on_dhcp_wamr(struct net_mgmt_event_callback *cb,
+                          uint64_t event, struct net_if *iface)
 {
-    while (uart_poll_in(dev, out) != 0) {
-        k_yield();
+    if (event == NET_EVENT_IPV4_DHCP_BOUND) {
+        k_sem_give(&net_ready_wamr);
     }
 }
 
+static void uart_read_byte(const struct device *dev, uint8_t *out)
+{
+    while (uart_poll_in(dev, out) != 0) { k_yield(); }
+}
+
+static void uart_drain_rx(const struct device *dev)
+{
+    uint8_t dummy;
+    int drained;
+    do {
+        drained = 0;
+        while (uart_poll_in(dev, &dummy) == 0) { drained++; }
+        if (drained > 0) { k_msleep(200); }
+    } while (drained > 0);
+}
+
+/* ==============================================================
+ * HOST FUNCTIONS
+ * ============================================================== */
+
+static int32_t host_wifi_connect_impl(wasm_exec_env_t exec_env,
+                                       uint32_t ssid_ptr, uint32_t ssid_len,
+                                       uint32_t psk_ptr,  uint32_t psk_len)
+{
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+    const char *ssid = (const char *)wasm_runtime_addr_app_to_native(inst, ssid_ptr);
+    const char *psk  = (const char *)wasm_runtime_addr_app_to_native(inst, psk_ptr);
+    if (!ssid || !psk) { return -1; }
+
+    struct net_if *iface = net_if_get_default();
+    if (!iface) { return -1; }
+
+    net_mgmt_init_event_callback(&dhcp_cb_wamr, on_dhcp_wamr, NET_EVENT_IPV4_DHCP_BOUND);
+    net_mgmt_add_event_callback(&dhcp_cb_wamr);
+
+    struct wifi_connect_req_params params = {
+        .ssid        = (const uint8_t *)ssid,
+        .ssid_length = (uint8_t)ssid_len,
+        .psk         = (const uint8_t *)psk,
+        .psk_length  = (uint8_t)psk_len,
+        .channel     = WIFI_CHANNEL_ANY,
+        .security    = WIFI_SECURITY_TYPE_PSK,
+        .mfp         = WIFI_MFP_OPTIONAL,
+        .band        = WIFI_FREQ_BAND_2_4_GHZ,
+        .timeout     = SYS_FOREVER_MS,
+    };
+
+    int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
+    if (ret == 0) { net_dhcpv4_start(iface); }
+    return ret;
+}
+
+static int32_t host_wait_network_ready_impl(wasm_exec_env_t exec_env,
+                                             uint32_t timeout_secs)
+{
+    ARG_UNUSED(exec_env);
+    return (k_sem_take(&net_ready_wamr, K_SECONDS(timeout_secs)) == 0) ? 0 : -1;
+}
+
+static void host_gpio_blink_impl(wasm_exec_env_t exec_env)
+{
+    ARG_UNUSED(exec_env);
+#if HAS_LED
+    if (device_is_ready(board_led.port)) {
+        gpio_pin_set_dt(&board_led, 1); k_msleep(150);
+        gpio_pin_set_dt(&board_led, 0); k_msleep(150);
+    }
+#endif
+}
+
+static int32_t host_tcp_connect_impl(wasm_exec_env_t exec_env,
+                                      uint32_t ip_ptr, uint32_t ip_len,
+                                      uint32_t port,   uint32_t timeout_secs)
+{
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+    const char *ip = (const char *)wasm_runtime_addr_app_to_native(inst, ip_ptr);
+    if (!ip) { return -1; }
+
+    /* Copier l'IP dans un buffer null-terminé */
+    char ip_str[32];
+    uint32_t copy_len = ip_len < sizeof(ip_str) - 1 ? ip_len : sizeof(ip_str) - 1;
+    memcpy(ip_str, ip, copy_len);
+    ip_str[copy_len] = '\0';
+
+    int sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) { return -1; }
+
+    struct zsock_timeval tv = { .tv_sec = timeout_secs, .tv_usec = 0 };
+    zsock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    zsock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t)port);
+
+    if (zsock_inet_pton(AF_INET, ip_str, &addr.sin_addr) != 1) {
+        zsock_close(sock);
+        return -1;
+    }
+
+    if (zsock_connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        zsock_close(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
+static int32_t host_tcp_send_impl(wasm_exec_env_t exec_env,
+                                   int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
+{
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+    const uint8_t *buf = (const uint8_t *)wasm_runtime_addr_app_to_native(inst, buf_ptr);
+    if (!buf) { return -1; }
+    return zsock_send(fd, buf, buf_len, 0);
+}
+
+static int32_t host_tcp_recv_impl(wasm_exec_env_t exec_env,
+                                   int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
+{
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+    uint8_t *buf = (uint8_t *)wasm_runtime_addr_app_to_native(inst, buf_ptr);
+    if (!buf) { return -1; }
+    return zsock_recv(fd, buf, buf_len, 0);
+}
+
+static void host_tcp_close_impl(wasm_exec_env_t exec_env, int32_t fd)
+{
+    ARG_UNUSED(exec_env);
+    zsock_close(fd);
+}
+
+static void host_sleep_impl(wasm_exec_env_t exec_env, uint32_t secs)
+{
+    ARG_UNUSED(exec_env);
+    k_sleep(K_SECONDS(secs));
+}
+
+static NativeSymbol native_symbols[] = {
+    { "host_wifi_connect",       host_wifi_connect_impl,       "(iiii)i", NULL },
+    { "host_wait_network_ready", host_wait_network_ready_impl, "(i)i",    NULL },
+    { "host_gpio_blink",         host_gpio_blink_impl,         "()",      NULL },
+    { "host_tcp_connect",        host_tcp_connect_impl,        "(iiii)i", NULL },
+    { "host_tcp_send",           host_tcp_send_impl,           "(iii)i",  NULL },
+    { "host_tcp_recv",           host_tcp_recv_impl,           "(iii)i",  NULL },
+    { "host_tcp_close",          host_tcp_close_impl,          "(i)",     NULL },
+    { "host_sleep",              host_sleep_impl,              "(i)",     NULL },
+};
+
 /* ----------------------------------------------------------------
- * execute_wasm() — charge et exécute un module WASM
- *
- * Séquence WAMR :
- *   wasm_runtime_load()           → parse et valide le binaire
- *   wasm_runtime_instantiate()    → alloue mémoire linéaire + stack
- *   wasm_runtime_create_exec_env()→ crée l'environnement d'exécution
- *   wasm_runtime_lookup_function()→ cherche la fonction "_start"
- *   wasm_runtime_call_wasm()      → exécute la fonction
+ * execute_wasm()
  * ---------------------------------------------------------------- */
 static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
 {
     char error_buf[128];
+    wasm_module_t        module      = NULL;
+    wasm_module_inst_t   module_inst = NULL;
+    wasm_exec_env_t      exec_env    = NULL;
+    wasm_function_inst_t func        = NULL;
 
-    wasm_module_t          module      = NULL;
-    wasm_module_inst_t     module_inst = NULL;
-    wasm_exec_env_t        exec_env    = NULL;
-    wasm_function_inst_t   func        = NULL;
-
-    /* 1. Charger le module WASM */
-    module = wasm_runtime_load(
-        wasm_data, wasm_size,
-        error_buf, sizeof(error_buf));
-
-    if (!module) {
-        printk("LOAD ERROR: %s\n", error_buf);
-        return;
-    }
+    module = wasm_runtime_load(wasm_data, wasm_size, error_buf, sizeof(error_buf));
+    if (!module) { printk("LOAD ERROR: %s\n", error_buf); return; }
     printk("Module charge OK\n");
 
-    /* 2. Instancier (alloue la mémoire linéaire WASM) */
-    module_inst = wasm_runtime_instantiate(
-        module,
-        STACK_SIZE,
-        HEAP_SIZE,
-        error_buf, sizeof(error_buf));
-
-    if (!module_inst) {
-        printk("INSTANTIATE ERROR: %s\n", error_buf);
-        goto cleanup_module;
-    }
+    module_inst = wasm_runtime_instantiate(module, STACK_SIZE, HEAP_SIZE,
+                                           error_buf, sizeof(error_buf));
+    if (!module_inst) { printk("INSTANTIATE ERROR: %s\n", error_buf); goto cleanup_module; }
     printk("Instance creee OK\n");
 
-    /* 3. Créer l'environnement d'exécution */
     exec_env = wasm_runtime_create_exec_env(module_inst, STACK_SIZE);
+    if (!exec_env) { printk("EXEC ENV FAILED\n"); goto cleanup_inst; }
 
-    if (!exec_env) {
-        printk("EXEC ENV FAILED\n");
-        goto cleanup_inst;
-    }
-
-    /* 4. Rechercher la fonction _start
-     *
-     * CORRECTION : wasm_runtime_lookup_function() n'accepte plus
-     * que 2 arguments depuis WAMR >= 1.3.
-     * Ancien prototype : lookup_function(inst, name, signature)
-     * Nouveau prototype : lookup_function(inst, name)
-     */
     func = wasm_runtime_lookup_function(module_inst, "_start");
+    if (!func) { printk("_start not found\n"); goto cleanup_env; }
 
-    if (!func) {
-        printk("_start not found\n");
-        goto cleanup_env;
-    }
-
-    /* 5. Exécuter */
     printk("Executing WASM...\n");
-
     if (!wasm_runtime_call_wasm(exec_env, func, 0, NULL)) {
-        printk("EXCEPTION: %s\n",
-               wasm_runtime_get_exception(module_inst));
+        printk("EXCEPTION: %s\n", wasm_runtime_get_exception(module_inst));
     } else {
         printk("Execution completed\n");
     }
 
-cleanup_env:
-    wasm_runtime_destroy_exec_env(exec_env);
-
-cleanup_inst:
-    wasm_runtime_deinstantiate(module_inst);
-
-cleanup_module:
-    wasm_runtime_unload(module);
+cleanup_env:    wasm_runtime_destroy_exec_env(exec_env);
+cleanup_inst:   wasm_runtime_deinstantiate(module_inst);
+cleanup_module: wasm_runtime_unload(module);
 }
 
 /* ----------------------------------------------------------------
@@ -147,45 +236,37 @@ cleanup_module:
  * ---------------------------------------------------------------- */
 int main(void)
 {
-    /* 1. Initialiser WAMR avec pool mémoire statique */
+#if HAS_LED
+    if (device_is_ready(board_led.port)) {
+        gpio_pin_configure_dt(&board_led, GPIO_OUTPUT_INACTIVE);
+    }
+#endif
+
     RuntimeInitArgs init_args;
     memset(&init_args, 0, sizeof(init_args));
+    init_args.mem_alloc_type                  = Alloc_With_Pool;
+    init_args.mem_alloc_option.pool.heap_buf  = global_heap;
+    init_args.mem_alloc_option.pool.heap_size = sizeof(global_heap);
 
-    init_args.mem_alloc_type                    = Alloc_With_Pool;
-    init_args.mem_alloc_option.pool.heap_buf    = global_heap;
-    init_args.mem_alloc_option.pool.heap_size   = sizeof(global_heap);
-
-    if (!wasm_runtime_full_init(&init_args)) {
-        printk("WAMR init failed\n");
-        return -1;
-    }
+    if (!wasm_runtime_full_init(&init_args)) { printk("WAMR init failed\n"); return -1; }
     printk("WAMR init OK\n");
 
-    /* 2. Récupérer le périphérique UART */
-    uart_dev = DEVICE_DT_GET(UART_NODE);
-
-    if (!device_is_ready(uart_dev)) {
-        printk("UART not ready\n");
-        return -1;
+    if (!wasm_runtime_register_natives("env", native_symbols, ARRAY_SIZE(native_symbols))) {
+        printk("Failed to register native symbols\n"); return -1;
     }
+    printk("Host functions enregistrees OK\n");
 
-    printk("\n");
-    printk("===== WAMR UART DEPLOYMENT =====\n");
+    uart_dev = DEVICE_DT_GET(UART_NODE);
+    if (!device_is_ready(uart_dev)) { printk("UART not ready\n"); return -1; }
+
+    printk("\n===== WAMR UART DEPLOYMENT =====\n");
     printk("Protocol : 4 bytes size (LE) + wasm binary\n");
     printk("Max size : %d bytes\n", WASM_MAX_SIZE);
 
-    /* 3. Boucle principale : attente upload → exécution */
     while (1) {
         uint32_t wasm_size = 0;
-
         printk("\nWaiting upload...\n");
 
-        /* Lire les 4 octets de taille (little-endian)
-         *
-         * CORRECTION : utiliser uart_read_byte() qui attend
-         * activement un octet disponible, au lieu de uart_poll_in()
-         * brut qui retourne -1 si rien n'est dispo et lirait 0xFF.
-         */
         for (int i = 0; i < 4; i++) {
             uint8_t b;
             uart_read_byte(uart_dev, &b);
@@ -194,21 +275,17 @@ int main(void)
 
         printk("Incoming size = %u bytes\n", wasm_size);
 
-        /* Vérifier que la taille est dans les limites */
         if (wasm_size == 0 || wasm_size > WASM_MAX_SIZE) {
-            printk("ERROR: invalid size (0 < size <= %d)\n",
-                   WASM_MAX_SIZE);
+            printk("ERROR: invalid size (0 < size <= %d)\n", WASM_MAX_SIZE);
+            uart_drain_rx(uart_dev);
             continue;
         }
 
-        /* Lire le binaire .wasm octet par octet */
         for (uint32_t i = 0; i < wasm_size; i++) {
             uart_read_byte(uart_dev, &wasm_buffer[i]);
         }
 
         printk("Upload complete (%u bytes)\n", wasm_size);
-
-        /* Charger et exécuter */
         execute_wasm(wasm_buffer, wasm_size);
     }
 
