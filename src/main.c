@@ -8,7 +8,6 @@
 #include <zephyr/net/net_event.h>
 #include <zephyr/net/dhcpv4.h>
 #include <zephyr/net/socket.h>
-#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
@@ -24,24 +23,24 @@ static const struct gpio_dt_spec board_led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
 #define HAS_LED 0
 #endif
 
-#define WASM_MAX_SIZE (32 * 1024)
-#define STACK_SIZE    (8  * 1024)
-#define HEAP_SIZE     (16 * 1024)
+#define WASM_MAX_SIZE  (32  * 1024)
+#define STACK_SIZE     (8   * 1024)
+#define HEAP_SIZE      (16  * 1024)
+#define WAMR_POOL_SIZE (160 * 1024)
 
-/* Seul buffer BSS statique : 32KB */
 static uint8_t wasm_buffer[WASM_MAX_SIZE];
 
-static const struct device *uart_dev;
+/* Pool WAMR aligné sur 8 octets — requis par l'allocateur WAMR interne */
+static char wamr_pool[WAMR_POOL_SIZE] __aligned(8);
 
+static const struct device *uart_dev;
 static K_SEM_DEFINE(net_ready_wamr, 0, 1);
 static struct net_mgmt_event_callback dhcp_cb_wamr;
 
 static void on_dhcp_wamr(struct net_mgmt_event_callback *cb,
                           uint64_t event, struct net_if *iface)
 {
-    if (event == NET_EVENT_IPV4_DHCP_BOUND) {
-        k_sem_give(&net_ready_wamr);
-    }
+    if (event == NET_EVENT_IPV4_DHCP_BOUND) { k_sem_give(&net_ready_wamr); }
 }
 
 static void uart_read_byte(const struct device *dev, uint8_t *out)
@@ -51,8 +50,7 @@ static void uart_read_byte(const struct device *dev, uint8_t *out)
 
 static void uart_drain_rx(const struct device *dev)
 {
-    uint8_t dummy;
-    int drained;
+    uint8_t dummy; int drained;
     do {
         drained = 0;
         while (uart_poll_in(dev, &dummy) == 0) { drained++; }
@@ -60,18 +58,45 @@ static void uart_drain_rx(const struct device *dev)
     } while (drained > 0);
 }
 
-/* ----------------------------------------------------------------
- * Fonctions d'allocation pointées vers malloc/free de picolibc.
- * Ces fonctions utilisent le libc heap (espace libre entre BSS
- * et fin de DRAM), séparé du k_heap utilisé par le réseau Zephyr.
- * ---------------------------------------------------------------- */
-static void *wamr_malloc(unsigned int size)  { return malloc(size); }
-static void *wamr_realloc(void *ptr, unsigned int size) { return realloc(ptr, size); }
-static void  wamr_free(void *ptr)            { free(ptr); }
+/* HOST FUNCTIONS */
 
-/* ==============================================================
- * HOST FUNCTIONS
- * ============================================================== */
+static void host_print_impl(wasm_exec_env_t exec_env,
+                             uint32_t msg_ptr, uint32_t msg_len)
+{
+    if (msg_ptr == 0 || msg_len == 0) { return; }
+
+    wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
+    const char *msg = NULL;
+
+    /* wasm_runtime_addr_app_to_native() attend un offset RELATIF [0, mem_size).
+     * wasm32-unknown-unknown génère des adresses ABSOLUES dans la mémoire
+     * linéaire WASM (ex: 0x3FCB0F50 = base_lineaire + offset).
+     * Ces adresses absolues sont dans le wamr_pool → on peut les utiliser
+     * directement comme pointeurs natifs. */
+    msg = (const char *)wasm_runtime_addr_app_to_native(inst, msg_ptr);
+
+    if (!msg) {
+        /* Adresse absolue native : vérifier qu'elle est dans le wamr_pool */
+        uintptr_t pool_start = (uintptr_t)wamr_pool;
+        uintptr_t pool_end   = pool_start + WAMR_POOL_SIZE;
+        uintptr_t ptr_val    = (uintptr_t)(uint32_t)msg_ptr;
+        /* Essayer aussi le cast direct (adresse 32 bits sur ESP32) */
+        const char *direct   = (const char *)ptr_val;
+        if (ptr_val >= pool_start && ptr_val < pool_end) {
+            msg = direct;
+        } else {
+            printk("[PRINT] hors pool: ptr=%u pool=[%p,%p]\n",
+                   msg_ptr, (void *)pool_start, (void *)pool_end);
+            return;
+        }
+    }
+
+    uint32_t copy_len = msg_len < 255 ? msg_len : 255;
+    char buf[256];
+    memcpy(buf, msg, copy_len);
+    buf[copy_len] = '\0';
+    printk("%s", buf);
+}
 
 static int32_t host_wifi_connect_impl(wasm_exec_env_t exec_env,
     uint32_t ssid_ptr, uint32_t ssid_len,
@@ -81,25 +106,17 @@ static int32_t host_wifi_connect_impl(wasm_exec_env_t exec_env,
     const char *ssid = (const char *)wasm_runtime_addr_app_to_native(inst, ssid_ptr);
     const char *psk  = (const char *)wasm_runtime_addr_app_to_native(inst, psk_ptr);
     if (!ssid || !psk) { return -1; }
-
     struct net_if *iface = net_if_get_default();
     if (!iface) { return -1; }
-
     net_mgmt_init_event_callback(&dhcp_cb_wamr, on_dhcp_wamr, NET_EVENT_IPV4_DHCP_BOUND);
     net_mgmt_add_event_callback(&dhcp_cb_wamr);
-
     struct wifi_connect_req_params params = {
-        .ssid        = (const uint8_t *)ssid,
-        .ssid_length = (uint8_t)ssid_len,
-        .psk         = (const uint8_t *)psk,
-        .psk_length  = (uint8_t)psk_len,
-        .channel     = WIFI_CHANNEL_ANY,
-        .security    = WIFI_SECURITY_TYPE_PSK,
-        .mfp         = WIFI_MFP_OPTIONAL,
-        .band        = WIFI_FREQ_BAND_2_4_GHZ,
-        .timeout     = SYS_FOREVER_MS,
+        .ssid = (const uint8_t *)ssid, .ssid_length = (uint8_t)ssid_len,
+        .psk  = (const uint8_t *)psk,  .psk_length  = (uint8_t)psk_len,
+        .channel = WIFI_CHANNEL_ANY, .security = WIFI_SECURITY_TYPE_PSK,
+        .mfp = WIFI_MFP_OPTIONAL, .band = WIFI_FREQ_BAND_2_4_GHZ,
+        .timeout = SYS_FOREVER_MS,
     };
-
     int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
     if (ret == 0) { net_dhcpv4_start(iface); }
     return ret;
@@ -129,19 +146,14 @@ static int32_t host_tcp_connect_impl(wasm_exec_env_t exec_env,
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
     const char *ip = (const char *)wasm_runtime_addr_app_to_native(inst, ip_ptr);
     if (!ip) { return -1; }
-
     char ip_str[32];
     uint32_t n = ip_len < sizeof(ip_str)-1 ? ip_len : sizeof(ip_str)-1;
-    memcpy(ip_str, ip, n);
-    ip_str[n] = '\0';
-
+    memcpy(ip_str, ip, n); ip_str[n] = '\0';
     int sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) { return -1; }
-
     struct zsock_timeval tv = { .tv_sec = timeout_secs, .tv_usec = 0 };
     zsock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     zsock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons((uint16_t)port);
@@ -174,17 +186,16 @@ static int32_t host_tcp_recv_impl(wasm_exec_env_t exec_env,
 
 static void host_tcp_close_impl(wasm_exec_env_t exec_env, int32_t fd)
 {
-    ARG_UNUSED(exec_env);
-    zsock_close(fd);
+    ARG_UNUSED(exec_env); zsock_close(fd);
 }
 
 static void host_sleep_impl(wasm_exec_env_t exec_env, uint32_t secs)
 {
-    ARG_UNUSED(exec_env);
-    k_sleep(K_SECONDS(secs));
+    ARG_UNUSED(exec_env); k_sleep(K_SECONDS(secs));
 }
 
 static NativeSymbol native_symbols[] = {
+    { "host_print",              host_print_impl,              "(*~)",    NULL },
     { "host_wifi_connect",       host_wifi_connect_impl,       "(iiii)i", NULL },
     { "host_wait_network_ready", host_wait_network_ready_impl, "(i)i",    NULL },
     { "host_gpio_blink",         host_gpio_blink_impl,         "()",      NULL },
@@ -203,13 +214,20 @@ static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
     wasm_exec_env_t      exec_env    = NULL;
     wasm_function_inst_t func        = NULL;
 
+    printk("[POOL] addr=%p size=%d KB align=%d\n",
+           wamr_pool, WAMR_POOL_SIZE/1024,
+           ((uintptr_t)wamr_pool % 8 == 0) ? 8 : 0);
+
     module = wasm_runtime_load(wasm_data, wasm_size, error_buf, sizeof(error_buf));
     if (!module) { printk("LOAD ERROR: %s\n", error_buf); return; }
     printk("Module charge OK\n");
 
     module_inst = wasm_runtime_instantiate(module, STACK_SIZE, HEAP_SIZE,
                                            error_buf, sizeof(error_buf));
-    if (!module_inst) { printk("INSTANTIATE ERROR: %s\n", error_buf); goto cleanup_module; }
+    if (!module_inst) {
+        printk("INSTANTIATE ERROR: %s\n", error_buf);
+        goto cleanup_module;
+    }
     printk("Instance creee OK\n");
 
     exec_env = wasm_runtime_create_exec_env(module_inst, STACK_SIZE);
@@ -238,26 +256,22 @@ int main(void)
     }
 #endif
 
+    printk("[POOL] wamr_pool=%p aligned8=%d\n",
+           wamr_pool, (uintptr_t)wamr_pool % 8 == 0 ? 1 : 0);
+
     RuntimeInitArgs init_args;
     memset(&init_args, 0, sizeof(init_args));
-
-    /*
-     * Alloc_With_Allocator → malloc/free de picolibc (libc heap).
-     * Séparé du k_heap Zephyr utilisé par le réseau.
-     * CONFIG_COMMON_LIBC_MALLOC_ARENA_SIZE dans prj.conf contrôle
-     * la taille maximale de cet espace (192KB).
-     */
-    init_args.mem_alloc_type = Alloc_With_Allocator;
-    init_args.mem_alloc_option.allocator.malloc_func  = wamr_malloc;
-    init_args.mem_alloc_option.allocator.realloc_func = wamr_realloc;
-    init_args.mem_alloc_option.allocator.free_func    = wamr_free;
+    init_args.mem_alloc_type                  = Alloc_With_Pool;
+    init_args.mem_alloc_option.pool.heap_buf  = wamr_pool;
+    init_args.mem_alloc_option.pool.heap_size = sizeof(wamr_pool);
 
     if (!wasm_runtime_full_init(&init_args)) {
         printk("WAMR init failed\n"); return -1;
     }
-    printk("WAMR init OK\n");
+    printk("WAMR init OK (pool=%dKB, Alloc_With_Pool)\n", WAMR_POOL_SIZE/1024);
 
-    if (!wasm_runtime_register_natives("env", native_symbols, ARRAY_SIZE(native_symbols))) {
+    if (!wasm_runtime_register_natives("env", native_symbols,
+                                       ARRAY_SIZE(native_symbols))) {
         printk("Failed to register native symbols\n"); return -1;
     }
     printk("Host functions enregistrees OK\n");

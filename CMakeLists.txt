@@ -19,6 +19,9 @@ set(WAMR_BUILD_LIBC_BUILTIN  1        CACHE BOOL   "" FORCE)
 set(WAMR_BUILD_SHARED_MEMORY 0        CACHE BOOL   "" FORCE)
 set(WAMR_BUILD_BULK_MEMORY   1        CACHE BOOL   "" FORCE)
 set(WAMR_BUILD_REF_TYPES     0        CACHE BOOL   "" FORCE)
+# SHRUNK_MEMORY alloue ~1 MB par module (16 pages + overhead)
+# au lieu de 1 page exacte (64 KB) — incompatible avec notre pool de 128 KB
+set(WAMR_BUILD_SHRUNK_MEMORY 0        CACHE BOOL   "" FORCE)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(zephyr_wamr_runtime)
