@@ -23,7 +23,7 @@ static const struct gpio_dt_spec board_led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
 #define HAS_LED 0
 #endif
 
-#define WASM_MAX_SIZE  (32  * 1024)
+#define WASM_MAX_SIZE  (40  * 1024)
 #define STACK_SIZE     (8   * 1024)
 #define HEAP_SIZE      (16  * 1024)
 #define WAMR_POOL_SIZE (160 * 1024)
@@ -50,47 +50,61 @@ static void uart_read_byte(const struct device *dev, uint8_t *out)
 
 static void uart_drain_rx(const struct device *dev)
 {
-    uint8_t dummy; int drained;
+    /* Vider le buffer UART jusqu'à ce qu'il soit silencieux pendant 500ms.
+     * Après un rejet de taille, upload.py continue d'envoyer le binaire.
+     * Il faut absorber TOUS ces octets avant d'attendre le prochain envoi. */
+    uint8_t dummy;
+    int drained;
+    int rounds = 0;
     do {
         drained = 0;
         while (uart_poll_in(dev, &dummy) == 0) { drained++; }
-        if (drained > 0) { k_msleep(200); }
-    } while (drained > 0);
+        if (drained > 0) {
+            k_msleep(300);  /* attendre que plus d'octets arrivent */
+            rounds = 0;
+        } else {
+            rounds++;
+            k_msleep(100);
+        }
+    } while (rounds < 5);  /* 5 × 100ms = 500ms de silence = canal vide */
+    printk("UART resync OK\n");
 }
 
 /* HOST FUNCTIONS */
 
+/* ----------------------------------------------------------------
+ * wasm_ptr_to_native() — résolution d'un pointeur WASM en natif
+ *
+ * wasm32-unknown-unknown génère des adresses ABSOLUES natives pour
+ * les &str et &[u8]. wasm_runtime_addr_app_to_native() retourne NULL
+ * car elle attend un offset relatif [0, mem_size).
+ * On vérifie donc aussi si le pointeur est directement dans wamr_pool.
+ * ---------------------------------------------------------------- */
+static const char *wasm_ptr_to_native(wasm_module_inst_t inst,
+                                       uint32_t ptr, uint32_t len)
+{
+    if (ptr == 0 || len == 0) { return NULL; }
+
+    /* Tentative 1 : offset relatif WASM */
+    const char *p = (const char *)wasm_runtime_addr_app_to_native(inst, ptr);
+    if (p) { return p; }
+
+    /* Tentative 2 : adresse absolue native dans wamr_pool */
+    uintptr_t pool_start = (uintptr_t)wamr_pool;
+    uintptr_t pool_end   = pool_start + WAMR_POOL_SIZE;
+    uintptr_t val        = (uintptr_t)(uint32_t)ptr;
+    if (val >= pool_start && val < pool_end) {
+        return (const char *)val;
+    }
+    return NULL;
+}
+
 static void host_print_impl(wasm_exec_env_t exec_env,
                              uint32_t msg_ptr, uint32_t msg_len)
 {
-    if (msg_ptr == 0 || msg_len == 0) { return; }
-
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
-    const char *msg = NULL;
-
-    /* wasm_runtime_addr_app_to_native() attend un offset RELATIF [0, mem_size).
-     * wasm32-unknown-unknown génère des adresses ABSOLUES dans la mémoire
-     * linéaire WASM (ex: 0x3FCB0F50 = base_lineaire + offset).
-     * Ces adresses absolues sont dans le wamr_pool → on peut les utiliser
-     * directement comme pointeurs natifs. */
-    msg = (const char *)wasm_runtime_addr_app_to_native(inst, msg_ptr);
-
-    if (!msg) {
-        /* Adresse absolue native : vérifier qu'elle est dans le wamr_pool */
-        uintptr_t pool_start = (uintptr_t)wamr_pool;
-        uintptr_t pool_end   = pool_start + WAMR_POOL_SIZE;
-        uintptr_t ptr_val    = (uintptr_t)(uint32_t)msg_ptr;
-        /* Essayer aussi le cast direct (adresse 32 bits sur ESP32) */
-        const char *direct   = (const char *)ptr_val;
-        if (ptr_val >= pool_start && ptr_val < pool_end) {
-            msg = direct;
-        } else {
-            printk("[PRINT] hors pool: ptr=%u pool=[%p,%p]\n",
-                   msg_ptr, (void *)pool_start, (void *)pool_end);
-            return;
-        }
-    }
-
+    const char *msg = wasm_ptr_to_native(inst, msg_ptr, msg_len);
+    if (!msg) { return; }
     uint32_t copy_len = msg_len < 255 ? msg_len : 255;
     char buf[256];
     memcpy(buf, msg, copy_len);
@@ -103,8 +117,8 @@ static int32_t host_wifi_connect_impl(wasm_exec_env_t exec_env,
     uint32_t psk_ptr,  uint32_t psk_len)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
-    const char *ssid = (const char *)wasm_runtime_addr_app_to_native(inst, ssid_ptr);
-    const char *psk  = (const char *)wasm_runtime_addr_app_to_native(inst, psk_ptr);
+    const char *ssid = wasm_ptr_to_native(inst, ssid_ptr, ssid_len);
+    const char *psk  = wasm_ptr_to_native(inst, psk_ptr,  psk_len);
     if (!ssid || !psk) { return -1; }
     struct net_if *iface = net_if_get_default();
     if (!iface) { return -1; }
@@ -144,7 +158,7 @@ static int32_t host_tcp_connect_impl(wasm_exec_env_t exec_env,
     uint32_t ip_ptr, uint32_t ip_len, uint32_t port, uint32_t timeout_secs)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
-    const char *ip = (const char *)wasm_runtime_addr_app_to_native(inst, ip_ptr);
+    const char *ip = wasm_ptr_to_native(inst, ip_ptr, ip_len);
     if (!ip) { return -1; }
     char ip_str[32];
     uint32_t n = ip_len < sizeof(ip_str)-1 ? ip_len : sizeof(ip_str)-1;
@@ -170,7 +184,7 @@ static int32_t host_tcp_send_impl(wasm_exec_env_t exec_env,
     int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
-    const uint8_t *buf = (const uint8_t *)wasm_runtime_addr_app_to_native(inst, buf_ptr);
+    const uint8_t *buf = (const uint8_t *)wasm_ptr_to_native(inst, buf_ptr, buf_len);
     if (!buf) { return -1; }
     return zsock_send(fd, buf, buf_len, 0);
 }
@@ -179,7 +193,7 @@ static int32_t host_tcp_recv_impl(wasm_exec_env_t exec_env,
     int32_t fd, uint32_t buf_ptr, uint32_t buf_len)
 {
     wasm_module_inst_t inst = wasm_runtime_get_module_inst(exec_env);
-    uint8_t *buf = (uint8_t *)wasm_runtime_addr_app_to_native(inst, buf_ptr);
+    uint8_t *buf = (uint8_t *)wasm_ptr_to_native(inst, buf_ptr, buf_len);
     if (!buf) { return -1; }
     return zsock_recv(fd, buf, buf_len, 0);
 }
@@ -233,8 +247,16 @@ static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
     exec_env = wasm_runtime_create_exec_env(module_inst, STACK_SIZE);
     if (!exec_env) { printk("EXEC ENV FAILED\n"); goto cleanup_inst; }
 
+    /* Chercher _start (no_std) puis main (std/WASI) */
     func = wasm_runtime_lookup_function(module_inst, "_start");
-    if (!func) { printk("_start not found\n"); goto cleanup_env; }
+    if (!func) {
+        func = wasm_runtime_lookup_function(module_inst, "main");
+    }
+    if (!func) {
+        func = wasm_runtime_lookup_function(module_inst, "__main_void");
+    }
+    if (!func) { printk("point entree introuvable (_start/main)\n"); goto cleanup_env; }
+    printk("Point entree trouve\n");
 
     printk("Executing WASM...\n");
     if (!wasm_runtime_call_wasm(exec_env, func, 0, NULL)) {
