@@ -18,7 +18,7 @@ cd ~/zephyrproject
 git clone https://github.com/bytecodealliance/wasm-micro-runtime.git
 
 # cloner le repository
-git clone https://github.com/BrayanneImt/zephyr_http_blinky.git
+git clone https://github.com/BrayanneImt/zephyr_wamr_runtime.git
 
 # Structure attendue
 zephyrproject/
